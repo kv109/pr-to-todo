@@ -335,6 +335,24 @@ html_content = """<!DOCTYPE html>
     min-width: 120px;
   }
 
+  .clear-btn {
+    background: none;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    cursor: pointer;
+    color: var(--text-secondary);
+    font-size: 1rem;
+    line-height: 1;
+    padding: 2px 6px;
+    align-self: flex-start;
+    margin-top: 2px;
+  }
+
+  .clear-btn:hover {
+    color: var(--text);
+    border-color: var(--text-secondary);
+  }
+
   .thread {
     border: 1px solid var(--border);
     border-radius: 8px;
@@ -608,10 +626,12 @@ html_content = """<!DOCTYPE html>
   <div class="author-filter">
     <label>Include:</label>
     <select id="include-authors" multiple size="3"></select>
+    <button class="clear-btn" data-target="include-authors" title="Clear selection">&times;</button>
   </div>
   <div class="author-filter">
     <label>Exclude:</label>
     <select id="exclude-authors" multiple size="3"></select>
+    <button class="clear-btn" data-target="exclude-authors" title="Clear selection">&times;</button>
   </div>
 </div>
 
@@ -705,6 +725,15 @@ html_content = """<!DOCTYPE html>
     state._excludeAuthors = getSelected(excludeSelect);
     saveState(state);
     applyFilters();
+  });
+
+  // Clear buttons for author filters
+  document.querySelectorAll(".clear-btn").forEach(function(btn) {
+    btn.addEventListener("click", function() {
+      var sel = document.getElementById(this.dataset.target);
+      Array.from(sel.options).forEach(function(opt) { opt.selected = false; });
+      sel.dispatchEvent(new Event("change"));
+    });
   });
 
   // Copy filename buttons
