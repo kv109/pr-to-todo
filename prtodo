@@ -50,7 +50,9 @@ query($owner: String!, $repo: String!, $pr: Int!) {
 
 echo "Processing..."
 
-OUTPUT_FILE="pr-${PR_NUMBER}-todos.html"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+mkdir -p "${SCRIPT_DIR}/output"
+OUTPUT_FILE="${SCRIPT_DIR}/output/pr-${PR_NUMBER}-todos.html"
 
 # Feed all JSON to Python via a here-string on fd 3
 python3 -c '
