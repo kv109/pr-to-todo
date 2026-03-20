@@ -818,4 +818,5 @@ $RESOLVED_THREADS
 EOF
 
 echo ""
-echo "Done! Open ${OUTPUT_FILE} in your browser."
+echo "Done! Opening ${OUTPUT_FILE}..."
+open "${OUTPUT_FILE}"
