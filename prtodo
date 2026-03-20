@@ -326,34 +326,53 @@ html_content = """<!DOCTYPE html>
   .author-filter label {
     font-size: 0.82rem;
     color: var(--text-secondary);
-    padding-top: 4px;
+    padding-top: 7px;
+    font-weight: 500;
   }
 
   .author-filter select {
-    padding: 2px 4px;
+    padding: 6px 8px;
     border: 1px solid var(--border);
     border-radius: 6px;
     font-size: 0.82rem;
-    background: var(--bg);
-    min-width: 120px;
+    background: var(--surface);
+    min-width: 140px;
+    color: var(--text);
+    outline: none;
+    transition: border-color 0.15s, box-shadow 0.15s;
+  }
+
+  .author-filter select:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 2px rgba(9, 105, 218, 0.15);
+  }
+
+  .author-filter select option {
+    padding: 4px 8px;
+  }
+
+  .author-filter select option:checked {
+    background: var(--accent);
+    color: white;
   }
 
   .clear-btn {
-    background: none;
+    background: var(--surface);
     border: 1px solid var(--border);
-    border-radius: 4px;
+    border-radius: 6px;
     cursor: pointer;
     color: var(--text-secondary);
     font-size: 1rem;
     line-height: 1;
-    padding: 2px 6px;
+    padding: 6px 8px;
     align-self: flex-start;
-    margin-top: 2px;
+    transition: all 0.15s;
   }
 
   .clear-btn:hover {
     color: var(--text);
     border-color: var(--text-secondary);
+    background: var(--bg);
   }
 
   .thread {
