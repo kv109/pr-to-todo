@@ -36,6 +36,7 @@ query($owner: String!, $repo: String!, $pr: Int!) {
     pullRequest(number: $pr) {
       reviewThreads(first: 100) {
         nodes {
+          id
           isResolved
           comments(first: 1) {
             nodes {
@@ -50,12 +51,8 @@ query($owner: String!, $repo: String!, $pr: Int!) {
 
 echo "Processing..."
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-mkdir -p "${SCRIPT_DIR}/output"
-OUTPUT_FILE="${SCRIPT_DIR}/output/pr-${PR_NUMBER}-todos.html"
-
-# Feed all JSON to Python via a here-string on fd 3
-python3 -c '
+# Feed all JSON to Python via a here-string on fd 3; exec replaces bash so Ctrl+C propagates
+exec python3 -c '
 import json
 import sys
 import html as html_mod
@@ -65,7 +62,6 @@ import hashlib
 from datetime import datetime
 
 pr_url = sys.argv[1]
-output_file = sys.argv[2]
 
 # Read the combined JSON from fd 3
 raw = os.fdopen(3).read()
@@ -75,14 +71,18 @@ review_comments = json.loads(lines[1])
 resolved_threads_data = json.loads(lines[2])
 
 # Build set of thread root comment IDs that are resolved on GitHub
+# and a mapping of databaseId -> GraphQL node ID for mutations
 gh_resolved_ids = set()
+thread_node_ids = {}
 try:
     nodes = resolved_threads_data["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]
     for node in nodes:
-        if node.get("isResolved"):
-            comments = node.get("comments", {}).get("nodes", [])
-            if comments:
-                gh_resolved_ids.add(comments[0]["databaseId"])
+        comments = node.get("comments", {}).get("nodes", [])
+        if comments:
+            db_id = comments[0]["databaseId"]
+            thread_node_ids[db_id] = node["id"]
+            if node.get("isResolved"):
+                gh_resolved_ids.add(db_id)
 except (KeyError, TypeError):
     pass
 
@@ -197,9 +197,10 @@ for idx, thread in enumerate(final_threads):
     is_gh_resolved = thread_id in gh_resolved_ids
     gh_resolved_attr = " data-gh-resolved=\"true\"" if is_gh_resolved else ""
     gh_resolved_label = "<span class=\"gh-resolved-label\">resolved</span>" if is_gh_resolved else ""
+    node_id = thread_node_ids.get(thread_id, "")
 
     threads_html += f"""
-    <div class="thread" data-thread-id="{thread_id}" data-authors="{escape(authors_str)}"{gh_resolved_attr}>
+    <div class="thread" data-thread-id="{thread_id}" data-node-id="{escape(node_id)}" data-authors="{escape(authors_str)}"{gh_resolved_attr}>
       <div class="thread-header">
         <label class="checkbox-label">
           <input type="checkbox" class="resolve-check" data-thread-id="{thread_id}">
@@ -373,7 +374,7 @@ html_content = """<!DOCTYPE html>
     opacity: 0.6;
   }
 
-  .thread.hidden {
+  .hidden {
     display: none;
   }
 
@@ -666,22 +667,50 @@ html_content = """<!DOCTYPE html>
 
   document.querySelectorAll(".resolve-check").forEach(function(cb) {
     var tid = cb.dataset.threadId;
-    if (state[tid]) {
+    var thread = cb.closest(".thread");
+    var ghResolved = thread.dataset.ghResolved === "true";
+    // On load, use GitHub truth (data-gh-resolved), fall back to localStorage
+    if (ghResolved || state[tid]) {
       cb.checked = true;
-      cb.closest(".thread").classList.add("resolved");
+      thread.classList.add("resolved");
     }
     cb.addEventListener("change", function() {
-      var thread = this.closest(".thread");
-      if (this.checked) {
-        state[tid] = true;
-        thread.classList.add("resolved");
-      } else {
-        delete state[tid];
-        thread.classList.remove("resolved");
-      }
+      var checked = this.checked;
+      var nodeId = thread.dataset.nodeId;
+      var endpoint = checked ? "/api/resolve" : "/api/unresolve";
+      // Optimistic UI
+      thread.classList.toggle("resolved", checked);
+      if (checked) { state[tid] = true; } else { delete state[tid]; }
       saveState(state);
       updateStats();
       applyFilters();
+      // Call server to mutate on GitHub
+      if (nodeId) {
+        fetch(endpoint, {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({nodeId: nodeId})
+        }).then(function(r) { return r.json(); }).then(function(data) {
+          if (data.error) {
+            // Revert on failure
+            cb.checked = !checked;
+            thread.classList.toggle("resolved", !checked);
+            if (!checked) { state[tid] = true; } else { delete state[tid]; }
+            saveState(state);
+            updateStats();
+            applyFilters();
+            alert("GitHub error: " + data.error);
+          }
+        }).catch(function(err) {
+          cb.checked = !checked;
+          thread.classList.toggle("resolved", !checked);
+          if (!checked) { state[tid] = true; } else { delete state[tid]; }
+          saveState(state);
+          updateStats();
+          applyFilters();
+          alert("Network error: " + err.message);
+        });
+      }
     });
   });
 
@@ -806,17 +835,74 @@ html_content = """<!DOCTYPE html>
 </body>
 </html>"""
 
-with open(output_file, "w") as f:
-    f.write(html_content)
+import subprocess
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import webbrowser
+import signal
+import threading
 
-print("Generated: " + output_file)
-print("Total threads: " + str(total_threads))
-' "$PR_URL" "$OUTPUT_FILE" 3<<EOF
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/" or self.path == "":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(html_content.encode("utf-8"))
+        else:
+            self.send_error(404)
+
+    def do_POST(self):
+        if self.path in ("/api/resolve", "/api/unresolve"):
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length))
+            node_id = body.get("nodeId", "")
+            if not node_id:
+                self._json_response(400, {"error": "missing nodeId"})
+                return
+            if self.path == "/api/resolve":
+                mutation = "mutation($id:ID!){resolveReviewThread(input:{threadId:$id}){thread{isResolved}}}"
+            else:
+                mutation = "mutation($id:ID!){unresolveReviewThread(input:{threadId:$id}){thread{isResolved}}}"
+            try:
+                result = subprocess.run(
+                    ["gh", "api", "graphql", "-f", "query=" + mutation, "-f", "id=" + node_id],
+                    capture_output=True, text=True, timeout=15
+                )
+                if result.returncode != 0:
+                    self._json_response(502, {"error": result.stderr.strip() or "gh api failed"})
+                else:
+                    self._json_response(200, {"ok": True})
+            except Exception as e:
+                self._json_response(500, {"error": str(e)})
+        else:
+            self.send_error(404)
+
+    def _json_response(self, code, data):
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps(data).encode("utf-8"))
+
+    def log_message(self, fmt, *args):
+        pass  # suppress per-request logging
+
+server = HTTPServer(("127.0.0.1", 0), Handler)
+port = server.server_address[1]
+url = f"http://127.0.0.1:{port}"
+print(f"Serving at {url}", file=sys.stderr)
+print(f"Total threads: {total_threads}", file=sys.stderr)
+print("Press Ctrl+C to stop.", file=sys.stderr)
+
+threading.Timer(0.5, lambda: webbrowser.open(url)).start()
+
+signal.signal(signal.SIGINT, lambda *_: (server.shutdown(), sys.exit(0)))
+try:
+    server.serve_forever()
+except KeyboardInterrupt:
+    pass
+server.server_close()
+' "$PR_URL" 3<<EOF
 $PR_JSON
 $REVIEW_COMMENTS
 $RESOLVED_THREADS
 EOF
-
-echo ""
-echo "Done! Opening ${OUTPUT_FILE}..."
-open "${OUTPUT_FILE}"
