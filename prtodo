@@ -1,0 +1,790 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ $# -lt 1 ]; then
+  echo "Usage: prtodo <github-pr-url>"
+  echo "Example: prtodo https://github.com/owner/repo/pull/123"
+  exit 1
+fi
+
+PR_URL="$1"
+
+# Parse owner/repo/number from URL
+if [[ "$PR_URL" =~ github\.com/([^/]+)/([^/]+)/pull/([0-9]+) ]]; then
+  OWNER="${BASH_REMATCH[1]}"
+  REPO="${BASH_REMATCH[2]}"
+  PR_NUMBER="${BASH_REMATCH[3]}"
+else
+  echo "Error: Could not parse PR URL. Expected format: https://github.com/owner/repo/pull/123"
+  exit 1
+fi
+
+echo "Fetching PR #${PR_NUMBER} from ${OWNER}/${REPO}..."
+
+# Fetch PR metadata
+PR_JSON=$(gh pr view "$PR_NUMBER" --repo "${OWNER}/${REPO}" --json title,url,body,author)
+
+# Fetch review comments (threaded discussion on diffs)
+echo "Fetching review comments..."
+REVIEW_COMMENTS=$(gh api "repos/${OWNER}/${REPO}/pulls/${PR_NUMBER}/comments" --paginate 2>/dev/null || echo "[]")
+
+# Fetch thread resolution status via GraphQL
+echo "Fetching thread resolution status..."
+RESOLVED_THREADS=$(gh api graphql -f query='
+query($owner: String!, $repo: String!, $pr: Int!) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $pr) {
+      reviewThreads(first: 100) {
+        nodes {
+          isResolved
+          comments(first: 1) {
+            nodes {
+              databaseId
+            }
+          }
+        }
+      }
+    }
+  }
+}' -F owner="$OWNER" -F repo="$REPO" -F pr="$PR_NUMBER" 2>/dev/null || echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]}}}}}')
+
+echo "Processing..."
+
+OUTPUT_FILE="pr-${PR_NUMBER}-todos.html"
+
+# Feed all JSON to Python via a here-string on fd 3
+python3 -c '
+import json
+import sys
+import html as html_mod
+import re
+import os
+import hashlib
+from datetime import datetime
+
+pr_url = sys.argv[1]
+output_file = sys.argv[2]
+
+# Read the combined JSON from fd 3
+raw = os.fdopen(3).read()
+lines = raw.strip().split("\n")
+pr_json = json.loads(lines[0])
+review_comments = json.loads(lines[1])
+resolved_threads_data = json.loads(lines[2])
+
+# Build set of thread root comment IDs that are resolved on GitHub
+gh_resolved_ids = set()
+try:
+    nodes = resolved_threads_data["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]
+    for node in nodes:
+        if node.get("isResolved"):
+            comments = node.get("comments", {}).get("nodes", [])
+            if comments:
+                gh_resolved_ids.add(comments[0]["databaseId"])
+except (KeyError, TypeError):
+    pass
+
+pr_title = pr_json.get("title", "Unknown PR")
+pr_author = pr_json.get("author", {}).get("login", "unknown")
+pr_body = pr_json.get("body", "") or ""
+
+# Group review comments into threads
+threads = {}
+
+for c in review_comments:
+    reply_to = c.get("in_reply_to_id")
+    cid = c["id"]
+    if reply_to:
+        if reply_to not in threads:
+            threads[reply_to] = []
+        threads[reply_to].append(c)
+    else:
+        if cid not in threads:
+            threads[cid] = []
+        threads[cid].insert(0, c)
+
+# Ensure root comments are first in their thread
+final_threads = []
+for root_id, comments in threads.items():
+    root = None
+    others = []
+    for c in comments:
+        if c["id"] == root_id:
+            root = c
+        else:
+            others.append(c)
+    if root:
+        final_threads.append([root] + sorted(others, key=lambda x: x.get("created_at", "")))
+    else:
+        final_threads.append(sorted(comments, key=lambda x: x.get("created_at", "")))
+
+# Sort threads by file path, then by position
+def thread_sort_key(thread):
+    first = thread[0]
+    return (first.get("path", ""), first.get("original_position") or first.get("position") or 0)
+
+final_threads.sort(key=thread_sort_key)
+
+def format_date(iso_str):
+    try:
+        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+        return dt.strftime("%b %d, %Y %H:%M")
+    except:
+        return iso_str
+
+def escape(text):
+    return html_mod.escape(text or "")
+
+def render_markdown_basic(text):
+    if not text:
+        return ""
+    text = escape(text)
+    text = re.sub(r"```(\w*)\n(.*?)```", r"<pre><code>\2</code></pre>", text, flags=re.DOTALL)
+    text = re.sub(r"`([^`]+)`", r"<code>\1</code>", text)
+    text = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", text)
+    text = re.sub(r"(?<!\*)\*([^*]+)\*(?!\*)", r"<em>\1</em>", text)
+    text = text.replace("\n", "<br>")
+    return text
+
+# Build threads HTML
+threads_html = ""
+for idx, thread in enumerate(final_threads):
+    first = thread[0]
+    path = first.get("path", "unknown file")
+    diff_hunk = first.get("diff_hunk", "")
+    thread_id = first["id"]
+
+    comments_html = ""
+    authors_in_thread = set()
+    for c in thread:
+        author = c.get("user", {}).get("login", "unknown")
+        authors_in_thread.add(author)
+        created = format_date(c.get("created_at", ""))
+        body = render_markdown_basic(c.get("body", ""))
+        comments_html += f"""
+        <div class="comment" data-author="{escape(author)}">
+          <div class="comment-header">
+            <strong class="author">{escape(author)}</strong>
+            <span class="date">{created}</span>
+          </div>
+          <div class="comment-body">{body}</div>
+        </div>"""
+
+    authors_str = ", ".join(sorted(authors_in_thread))
+    comment_count = len(thread)
+
+    diff_html = ""
+    if diff_hunk:
+        diff_lines = ""
+        for line in diff_hunk.split("\n"):
+            escaped_line = escape(line)
+            if line.startswith("@@"):
+                diff_lines += "<span class=\"diff-hunk-header\">" + escaped_line + "</span>\n"
+            elif line.startswith("+"):
+                diff_lines += "<span class=\"diff-add\">" + escaped_line + "</span>\n"
+            elif line.startswith("-"):
+                diff_lines += "<span class=\"diff-del\">" + escaped_line + "</span>\n"
+            else:
+                diff_lines += escaped_line + "\n"
+        diff_html = f"""
+      <details class="diff-hunk">
+        <summary>Show diff context</summary>
+        <pre><code>{diff_lines.rstrip()}</code></pre>
+      </details>"""
+
+    is_gh_resolved = thread_id in gh_resolved_ids
+    gh_resolved_attr = " data-gh-resolved=\"true\"" if is_gh_resolved else ""
+    gh_resolved_label = "<span class=\"gh-resolved-label\">resolved</span>" if is_gh_resolved else ""
+
+    threads_html += f"""
+    <div class="thread" data-thread-id="{thread_id}" data-authors="{escape(authors_str)}"{gh_resolved_attr}>
+      <div class="thread-header">
+        <label class="checkbox-label">
+          <input type="checkbox" class="resolve-check" data-thread-id="{thread_id}">
+          <span class="checkmark"></span>
+        </label>
+        <div class="thread-meta">
+          <a class="file-path" href="{escape(pr_url)}/files#diff-{hashlib.sha256(path.encode()).hexdigest()}" target="_blank">{escape(path)}</a><button class="copy-btn" data-path="{escape(path)}" title="Copy filename"><svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M0 6.75C0 5.784.784 5 1.75 5h1.5a.75.75 0 0 1 0 1.5h-1.5a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-1.5a.75.75 0 0 1 1.5 0v1.5A1.75 1.75 0 0 1 9.25 16h-7.5A1.75 1.75 0 0 1 0 14.25Z"></path><path d="M5 1.75C5 .784 5.784 0 6.75 0h7.5C15.216 0 16 .784 16 1.75v7.5A1.75 1.75 0 0 1 14.25 11h-7.5A1.75 1.75 0 0 1 5 9.25Zm1.75-.25a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-7.5a.25.25 0 0 0-.25-.25Z"></path></svg></button> {gh_resolved_label}
+          <a class="thread-info" href="{escape(first.get("html_url", ""))}" target="_blank">{comment_count} comment{"s" if comment_count != 1 else ""} &middot; {escape(authors_str)}</a>
+        </div>
+      </div>
+      {diff_html}
+      <div class="thread-comments">{comments_html}</div>
+    </div>"""
+
+total_threads = len(final_threads)
+
+# Double braces for JS in f-string
+html_content = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PR #""" + escape(str(pr_url.split("/")[-1])) + """ TODOs - """ + escape(pr_title) + """</title>
+<style>
+  :root {
+    --bg: #ffffff;
+    --surface: #f6f8fa;
+    --border: #d1d9e0;
+    --text: #1f2328;
+    --text-secondary: #656d76;
+    --accent: #0969da;
+    --resolved-bg: #f0fdf4;
+    --resolved-border: #86efac;
+    --diff-bg: #f6f8fa;
+    --shadow: 0 1px 3px rgba(0,0,0,0.08);
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.5;
+    max-width: 960px;
+    margin: 0 auto;
+    padding: 24px 16px;
+  }
+
+  header {
+    margin-bottom: 24px;
+    padding-bottom: 16px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  header h1 {
+    font-size: 1.5rem;
+    margin-bottom: 4px;
+  }
+
+  header h1 a {
+    color: var(--text);
+    text-decoration: none;
+  }
+
+  header h1 a:hover {
+    color: var(--accent);
+    text-decoration: underline;
+  }
+
+  .stats {
+    color: var(--text-secondary);
+    font-size: 0.9rem;
+    margin-top: 8px;
+  }
+
+  .stats strong {
+    color: var(--text);
+  }
+
+  .controls {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: flex-start;
+    margin-bottom: 20px;
+  }
+
+  .status-filters {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    margin-right: auto;
+  }
+
+  .filter-btn {
+    padding: 5px 12px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg);
+    color: var(--text);
+    font-size: 0.85rem;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+
+  .filter-btn:hover {
+    background: var(--surface);
+  }
+
+  .filter-btn.active {
+    background: var(--accent);
+    color: white;
+    border-color: var(--accent);
+  }
+
+  .author-filter {
+    display: flex;
+    align-items: flex-start;
+    gap: 6px;
+  }
+
+  .author-filter label {
+    font-size: 0.82rem;
+    color: var(--text-secondary);
+    padding-top: 4px;
+  }
+
+  .author-filter select {
+    padding: 2px 4px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-size: 0.82rem;
+    background: var(--bg);
+    min-width: 120px;
+  }
+
+  .thread {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    margin-bottom: 12px;
+    background: var(--bg);
+    box-shadow: var(--shadow);
+    transition: opacity 0.2s, border-color 0.2s;
+  }
+
+  .thread.resolved {
+    background: var(--resolved-bg);
+    border-color: var(--resolved-border);
+  }
+
+  .thread.resolved .thread-comments {
+    opacity: 0.6;
+  }
+
+  .thread.hidden {
+    display: none;
+  }
+
+  .thread-header {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    padding: 12px 16px;
+  }
+
+  .checkbox-label {
+    position: relative;
+    cursor: pointer;
+    flex-shrink: 0;
+    margin-top: 2px;
+  }
+
+  .checkbox-label input {
+    position: absolute;
+    opacity: 0;
+    cursor: pointer;
+    height: 0;
+    width: 0;
+  }
+
+  .checkmark {
+    display: block;
+    width: 20px;
+    height: 20px;
+    border: 2px solid var(--border);
+    border-radius: 4px;
+    transition: all 0.15s;
+  }
+
+  .checkbox-label input:checked ~ .checkmark {
+    background: #2da44e;
+    border-color: #2da44e;
+  }
+
+  .checkbox-label input:checked ~ .checkmark::after {
+    content: "";
+    display: block;
+    width: 5px;
+    height: 10px;
+    border: solid white;
+    border-width: 0 2px 2px 0;
+    transform: rotate(45deg);
+    margin: 1px 0 0 5px;
+  }
+
+  .thread-meta {
+    flex: 1;
+    min-width: 0;
+  }
+
+  .file-path {
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+    font-size: 0.85rem;
+    color: var(--accent);
+    word-break: break-all;
+    text-decoration: none;
+  }
+
+  .file-path:hover {
+    text-decoration: underline;
+  }
+
+  .copy-btn {
+    background: none;
+    border: none;
+    cursor: pointer;
+    color: var(--text-secondary);
+    padding: 2px 4px;
+    margin-left: 4px;
+    border-radius: 3px;
+    vertical-align: middle;
+    line-height: 1;
+    opacity: 0.5;
+    transition: opacity 0.15s, color 0.15s;
+  }
+
+  .copy-btn:hover {
+    opacity: 1;
+    color: var(--accent);
+  }
+
+  .copy-btn.copied {
+    opacity: 1;
+    color: #2da44e;
+  }
+
+  .thread-info {
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+    text-decoration: none;
+  }
+
+  .thread-info:hover {
+    color: var(--accent);
+    text-decoration: underline;
+  }
+
+  .gh-resolved-label {
+    display: inline-block;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    font-size: 0.7rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.02em;
+    padding: 1px 6px;
+    border-radius: 4px;
+    background: #fef3c7;
+    color: #92400e;
+    border: 1px solid #fcd34d;
+    vertical-align: middle;
+    margin-left: 6px;
+  }
+
+  .diff-hunk {
+    margin: 0 16px;
+    border-top: 1px solid var(--border);
+  }
+
+  .diff-hunk summary {
+    padding: 8px 0;
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+    cursor: pointer;
+    user-select: none;
+  }
+
+  .diff-hunk pre {
+    background: var(--diff-bg);
+    border-radius: 6px;
+    padding: 12px;
+    overflow-x: auto;
+    font-size: 0.8rem;
+    line-height: 1.6;
+    margin-bottom: 8px;
+  }
+
+  .diff-add {
+    background: #dafbe1;
+    color: #1a7f37;
+    display: inline-block;
+    width: 100%;
+  }
+
+  .diff-del {
+    background: #ffebe9;
+    color: #cf222e;
+    display: inline-block;
+    width: 100%;
+  }
+
+  .diff-hunk-header {
+    color: #6639ba;
+    display: inline-block;
+    width: 100%;
+  }
+
+  .thread-comments {
+    padding: 0 16px 12px;
+  }
+
+  .comment {
+    padding: 10px 0;
+    border-top: 1px solid var(--border);
+  }
+
+  .comment-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    margin-bottom: 4px;
+  }
+
+  .author {
+    font-size: 0.85rem;
+  }
+
+  .date {
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+  }
+
+  .comment-body {
+    font-size: 0.9rem;
+    line-height: 1.6;
+  }
+
+  .comment-body code {
+    background: var(--surface);
+    padding: 2px 6px;
+    border-radius: 3px;
+    font-size: 0.85em;
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  }
+
+  .comment-body pre {
+    background: var(--surface);
+    border-radius: 6px;
+    padding: 12px;
+    overflow-x: auto;
+    margin: 8px 0;
+  }
+
+  .comment-body pre code {
+    padding: 0;
+    background: none;
+  }
+
+  .empty-state {
+    text-align: center;
+    padding: 48px 16px;
+    color: var(--text-secondary);
+  }
+
+  .progress-bar {
+    height: 4px;
+    background: var(--surface);
+    border-radius: 2px;
+    margin-top: 8px;
+    overflow: hidden;
+  }
+
+  .progress-fill {
+    height: 100%;
+    background: #2da44e;
+    border-radius: 2px;
+    transition: width 0.3s;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1><a href=\"""" + escape(pr_url) + """\" target="_blank">""" + escape(pr_title) + """</a></h1>
+  <div class="stats">
+    <span><strong id="resolved-count">0</strong> / <strong>""" + str(total_threads) + """</strong> threads resolved</span>
+    <span>&middot; by <strong>""" + escape(pr_author) + """</strong></span>
+  </div>
+  <div class="progress-bar"><div class="progress-fill" id="progress-fill"></div></div>
+</header>
+
+<div class="controls">
+  <div class="status-filters">
+    <button class="filter-btn active" data-filter="all">All (""" + str(total_threads) + """)</button>
+    <button class="filter-btn" data-filter="unresolved">Unresolved</button>
+    <button class="filter-btn" data-filter="resolved">Resolved</button>
+  </div>
+  <div class="author-filter">
+    <label>Include:</label>
+    <select id="include-authors" multiple size="3"></select>
+  </div>
+  <div class="author-filter">
+    <label>Exclude:</label>
+    <select id="exclude-authors" multiple size="3"></select>
+  </div>
+</div>
+
+<div id="threads-container">
+""" + threads_html + """
+</div>
+
+<div class="empty-state hidden" id="empty-state">
+  No threads match the current filter.
+</div>
+
+<script>
+(function() {
+  var PR_KEY = "prtodo:" + """ + json.dumps(pr_url) + """;
+  var totalThreads = """ + str(total_threads) + """;
+
+  function loadState() {
+    try {
+      return JSON.parse(localStorage.getItem(PR_KEY)) || {};
+    } catch(e) {
+      return {};
+    }
+  }
+
+  function saveState(state) {
+    localStorage.setItem(PR_KEY, JSON.stringify(state));
+  }
+
+  var state = loadState();
+
+  document.querySelectorAll(".resolve-check").forEach(function(cb) {
+    var tid = cb.dataset.threadId;
+    if (state[tid]) {
+      cb.checked = true;
+      cb.closest(".thread").classList.add("resolved");
+    }
+    cb.addEventListener("change", function() {
+      var thread = this.closest(".thread");
+      if (this.checked) {
+        state[tid] = true;
+        thread.classList.add("resolved");
+      } else {
+        delete state[tid];
+        thread.classList.remove("resolved");
+      }
+      saveState(state);
+      updateStats();
+      applyFilters();
+    });
+  });
+
+  // Populate author filters
+  var authors = new Set();
+  document.querySelectorAll(".thread").forEach(function(t) {
+    t.dataset.authors.split(", ").forEach(function(a) { authors.add(a); });
+  });
+  var includeSelect = document.getElementById("include-authors");
+  var excludeSelect = document.getElementById("exclude-authors");
+  Array.from(authors).sort().forEach(function(a) {
+    var opt1 = document.createElement("option");
+    opt1.value = a;
+    opt1.textContent = a;
+    includeSelect.appendChild(opt1);
+    var opt2 = document.createElement("option");
+    opt2.value = a;
+    opt2.textContent = a;
+    excludeSelect.appendChild(opt2);
+  });
+
+  function getSelected(sel) {
+    return Array.from(sel.selectedOptions).map(function(o) { return o.value; });
+  }
+
+  // Restore saved selections
+  function restoreSelection(sel, values) {
+    if (!values) return;
+    Array.from(sel.options).forEach(function(opt) {
+      if (values.indexOf(opt.value) !== -1) opt.selected = true;
+    });
+  }
+  restoreSelection(includeSelect, state._includeAuthors);
+  restoreSelection(excludeSelect, state._excludeAuthors);
+
+  includeSelect.addEventListener("change", function() {
+    state._includeAuthors = getSelected(includeSelect);
+    saveState(state);
+    applyFilters();
+  });
+
+  excludeSelect.addEventListener("change", function() {
+    state._excludeAuthors = getSelected(excludeSelect);
+    saveState(state);
+    applyFilters();
+  });
+
+  // Copy filename buttons
+  document.querySelectorAll(".copy-btn").forEach(function(btn) {
+    btn.addEventListener("click", function(e) {
+      e.preventDefault();
+      var path = this.dataset.path;
+      var button = this;
+      navigator.clipboard.writeText(path).then(function() {
+        button.classList.add("copied");
+        setTimeout(function() { button.classList.remove("copied"); }, 1000);
+      });
+    });
+  });
+
+  var currentFilter = "all";
+  document.querySelectorAll(".filter-btn").forEach(function(btn) {
+    btn.addEventListener("click", function() {
+      document.querySelectorAll(".filter-btn").forEach(function(b) { b.classList.remove("active"); });
+      this.classList.add("active");
+      currentFilter = this.dataset.filter;
+      applyFilters();
+    });
+  });
+
+  function applyFilters() {
+    var excluded = getSelected(excludeSelect);
+    var included = getSelected(includeSelect);
+    var visible = 0;
+    document.querySelectorAll(".thread").forEach(function(t) {
+      var isResolved = t.classList.contains("resolved");
+      var threadAuthors = t.dataset.authors.split(", ");
+
+      var show = true;
+      if (currentFilter === "resolved" && !isResolved) show = false;
+      if (currentFilter === "unresolved" && isResolved) show = false;
+
+      // Exclude has priority: hide if ANY thread author is in exclude list
+      if (excluded.length > 0 && threadAuthors.some(function(a) { return excluded.indexOf(a) !== -1; })) {
+        show = false;
+      }
+
+      // Include: if set, show only threads where at least one author is in include list
+      // (but exclude still wins)
+      if (show && included.length > 0 && !threadAuthors.some(function(a) { return included.indexOf(a) !== -1; })) {
+        show = false;
+      }
+
+      t.classList.toggle("hidden", !show);
+      if (show) visible++;
+    });
+
+    document.getElementById("empty-state").classList.toggle("hidden", visible > 0);
+  }
+
+  function updateStats() {
+    var resolved = document.querySelectorAll(".resolve-check:checked").length;
+    document.getElementById("resolved-count").textContent = resolved;
+    var pct = totalThreads > 0 ? (resolved / totalThreads * 100) : 0;
+    document.getElementById("progress-fill").style.width = pct + "%";
+  }
+
+  updateStats();
+  applyFilters();
+})();
+</script>
+
+</body>
+</html>"""
+
+with open(output_file, "w") as f:
+    f.write(html_content)
+
+print("Generated: " + output_file)
+print("Total threads: " + str(total_threads))
+' "$PR_URL" "$OUTPUT_FILE" 3<<EOF
+$PR_JSON
+$REVIEW_COMMENTS
+$RESOLVED_THREADS
+EOF
+
+echo ""
+echo "Done! Open ${OUTPUT_FILE} in your browser."
